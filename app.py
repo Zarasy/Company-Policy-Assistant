@@ -11,12 +11,10 @@ st.set_page_config(
     layout="wide"
 )
 
-# API key for Streamlit Cloud
+# Load Streamlit secrets
 try:
     if "GEMINI_API_KEY" in st.secrets:
-        os.environ["GEMINI_API_KEY"] = st.secrets[
-            "GEMINI_API_KEY"
-        ]
+        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
 except Exception:
     pass
 
@@ -27,9 +25,7 @@ st.caption(
     "full-context LLM and vector-index retrieval"
 )
 
-st.write(
-    f"Policy database: {len(policies())} records"
-)
+st.write(f"Policy database: {len(policies())} records")
 
 question = st.text_input(
     "Ask a policy question",
@@ -39,24 +35,43 @@ question = st.text_input(
 if "results" not in st.session_state:
     st.session_state.results = None
 
-if st.button("Compare approaches"):
-
+if st.button("Compare approaches", type="primary"):
     if question.strip():
-
         with st.spinner("Comparing approaches..."):
             st.session_state.results = compare(question)
 
 if st.session_state.results is not None:
+    results = st.session_state.results
+    df = pd.DataFrame(results)
 
-    results_df = pd.DataFrame(
-        st.session_state.results
-    )
+    st.subheader("Comparison results")
+
+    # Compact table with performance metrics
+    columns = [
+        "Approach",
+        "Response time (s)",
+        "Total tokens",
+        "Input tokens",
+        "Output tokens",
+        "Status"
+    ]
 
     st.dataframe(
-        results_df,
+        df[columns],
         hide_index=True,
         use_container_width=True
     )
+
+    st.subheader("Full answers")
+
+    for row in results:
+        with st.container(border=True):
+            st.markdown(f"### {row['Approach']}")
+
+            st.write(row["Answer"])
+
+            st.markdown("**Relevant policy:**")
+            st.write(row["Relevant policy"])
 
     st.info(
         "Rules-based search returns policy text directly. "
@@ -69,7 +84,7 @@ if st.session_state.results is not None:
 
     st.download_button(
         label="Download results CSV",
-        data=results_df.to_csv(index=False),
+        data=df.to_csv(index=False),
         file_name="policy_comparison.csv",
         mime="text/csv"
     )
