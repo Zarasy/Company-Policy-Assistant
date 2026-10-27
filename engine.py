@@ -12,63 +12,100 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-BASE = Path(__file__).resolve().parent
-load_dotenv(BASE / ".env")
 
-POLICY_FILE = BASE / "company_policies.csv"
-CACHE = BASE / ".embedding_cache"
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-GEN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-EMBED_MODEL = os.getenv(
-    "GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"
-)
+BASE_DIR = Path(__file__).resolve().parent
 
-STOP_WORDS = {
-    "a", "an", "the", "is", "are", "what", "how",
-    "can", "could", "do", "does", "i", "we",
-    "my", "our", "their", "they", "to", "for",
-    "and", "of", "in", "on", "at", "with",
-    "company", "policy", "employees", "employee",
-    "about", "please", "tell", "me"
-}
+load_dotenv(BASE_DIR / ".env")
 
+POLICY_FILE = BASE_DIR / "company_policies.csv"
+CACHE_DIR = BASE_DIR / ".embedding_cache"
+
+# New generation model
+GEN_MODEL = "gemini-3.5-flash-lite"
+
+# Gemini Embedding model for vector search
+EMBED_MODEL = "gemini-embedding-001"
+
+
+# =========================================================
+# LOAD POLICIES AND API CLIENT
+# =========================================================
 
 @lru_cache(maxsize=1)
 def policies():
     df = pd.read_csv(POLICY_FILE).fillna("")
-    required = {"title", "policy_text"}
 
-    if not required.issubset(df.columns):
-        raise ValueError("Missing policy columns")
+    required_columns = {"title", "policy_text"}
+
+    if not required_columns.issubset(df.columns):
+        raise ValueError(
+            "The CSV must contain title and policy_text."
+        )
 
     return df
 
 
 @lru_cache(maxsize=1)
 def client():
-    key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
 
-    if not key:
+    if not api_key:
+        # Also support Streamlit Cloud secrets
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("GEMINI_API_KEY")
+        except Exception:
+            pass
+
+    if not api_key:
         raise RuntimeError(
-            "GEMINI_API_KEY is missing from .env"
+            "GEMINI_API_KEY is missing. "
+            "Add it to .env or Streamlit Secrets."
         )
 
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=api_key)
 
+
+# =========================================================
+# API RETRY HANDLING
+# =========================================================
 
 def retry_api(operation, attempts=3):
-    """Retry temporary API failures only."""
+    """
+    Retry temporary server errors.
+
+    Do not retry exhausted daily quotas.
+    """
+
     for attempt in range(attempts):
         try:
             return operation()
+
         except Exception as error:
             message = str(error).lower()
+
+            # Daily quota exhausted: retries will not help
+            if (
+                "per day limit exceeded" in message
+                or "requests per day" in message
+                or "quota exceeded" in message
+            ):
+                raise
 
             temporary = any(
                 code in message
                 for code in [
-                    "429", "500", "502", "503", "504",
-                    "unavailable", "overloaded"
+                    "429",
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "unavailable",
+                    "overloaded"
                 ]
             )
 
@@ -78,13 +115,11 @@ def retry_api(operation, attempts=3):
             time.sleep(2 ** attempt)
 
 
-def words(text):
-    return set(
-        re.findall(r"[a-z0-9]+", str(text).lower())
-    ) - STOP_WORDS
+# =========================================================
+# SHARED RESULT FORMAT
+# =========================================================
 
-
-def result(answer, policy="None"):
+def empty_result(answer, policy="None"):
     return {
         "answer": answer,
         "policy": policy,
@@ -95,159 +130,264 @@ def result(answer, policy="None"):
     }
 
 
-# METHOD 1: RULES-BASED
+# =========================================================
+# METHOD 1: RULES-BASED SEARCH
+# =========================================================
+
+STOP_WORDS = {
+    "a", "an", "the", "is", "are",
+    "what", "how", "can", "could",
+    "do", "does", "i", "we",
+    "my", "our", "their", "they",
+    "to", "for", "and", "of",
+    "in", "on", "at", "with",
+    "company", "policy", "policies",
+    "employees", "employee",
+    "about", "please", "tell", "me"
+}
+
+
+def words(text):
+    return set(
+        re.findall(
+            r"[a-z0-9]+",
+            str(text).lower()
+        )
+    ) - STOP_WORDS
+
 
 def rules(question):
     df = policies()
-    q = words(question)
 
-    if not q:
-        return result("No matching policy found.")
+    question_words = words(question)
+
+    if not question_words:
+        return empty_result(
+            "No matching policy found."
+        )
 
     candidates = []
 
     for _, row in df.iterrows():
-        title = words(row["title"])
-        body = words(row["policy_text"])
 
-        title_matches = len(q & title)
-        body_matches = len(q & body)
+        title_words = words(row["title"])
+        body_words = words(row["policy_text"])
 
-        score = 3 * title_matches + body_matches
-        candidates.append((score, title_matches, row))
+        title_matches = len(
+            question_words & title_words
+        )
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
+        body_matches = len(
+            question_words & body_words
+        )
 
-    score, title_matches, best = candidates[0]
+        score = (
+            3 * title_matches
+            + body_matches
+        )
 
-    # Conservative keyword threshold.
-    # This is a heuristic, not proof of relevance.
+        candidates.append(
+            (score, title_matches, row)
+        )
+
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
+    score, title_matches, best_row = candidates[0]
+
+    # Reject weak keyword matches
     if score < 3 or (
-        title_matches == 0 and len(q) > 1
+        title_matches == 0
+        and len(question_words) > 1
     ):
-        return result(
+        return empty_result(
             "No sufficiently relevant policy found."
         )
 
-    return result(
-        str(best["policy_text"]),
-        str(best["title"])
+    return empty_result(
+        str(best_row["policy_text"]),
+        str(best_row["title"])
     )
 
 
+# =========================================================
 # GEMINI EMBEDDINGS
+# =========================================================
 
 def policy_documents(df):
-    return [
-        (
-            f"Title: {r['title']}\n"
-            f"Policy: {r['policy_text']}"
+    documents = []
+
+    for _, row in df.iterrows():
+
+        document = (
+            f"Title: {row['title']}\n"
+            f"Department: {row.get('department', '')}\n"
+            f"Category: {row.get('category', '')}\n"
+            f"Policy: {row['policy_text']}"
         )
-        for _, r in df.iterrows()
-    ]
+
+        documents.append(document)
+
+    return documents
 
 
-def embed(texts, task):
+def embed_texts(texts, task_type):
     vectors = []
 
-    for start in range(0, len(texts), 20):
-        batch = texts[start:start + 20]
+    batch_size = 20
+
+    for start in range(0, len(texts), batch_size):
+
+        batch = texts[
+            start:start + batch_size
+        ]
 
         response = retry_api(
             lambda: client().models.embed_content(
                 model=EMBED_MODEL,
                 contents=batch,
                 config=types.EmbedContentConfig(
-                    task_type=task
+                    task_type=task_type
                 )
             )
         )
 
-        vectors.extend(
-            item.values for item in response.embeddings
-        )
+        for item in response.embeddings:
+            vectors.append(item.values)
 
-    return np.asarray(vectors, dtype=np.float32)
+    return np.asarray(
+        vectors,
+        dtype=np.float32
+    )
 
 
-def document_vectors(df):
-    docs = policy_documents(df)
+def get_policy_embeddings(df):
+    documents = policy_documents(df)
 
     fingerprint = hashlib.sha256(
-        (EMBED_MODEL + "\n" + "\n".join(docs)).encode()
+        (
+            EMBED_MODEL
+            + "\n"
+            + "\n".join(documents)
+        ).encode("utf-8")
     ).hexdigest()
 
-    CACHE.mkdir(exist_ok=True)
-    path = CACHE / f"{fingerprint}.npy"
+    CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    if path.exists():
-        return np.load(path, allow_pickle=False)
+    cache_file = (
+        CACHE_DIR / f"{fingerprint}.npy"
+    )
 
-    vectors = embed(docs, "RETRIEVAL_DOCUMENT")
-    np.save(path, vectors)
+    if cache_file.exists():
+        return np.load(
+            cache_file,
+            allow_pickle=False
+        )
+
+    vectors = embed_texts(
+        documents,
+        "RETRIEVAL_DOCUMENT"
+    )
+
+    np.save(
+        cache_file,
+        vectors
+    )
 
     return vectors
 
 
 def vector_search(question, top_k=5):
     df = policies()
-    vectors = document_vectors(df)
 
-    query = embed(
-        [question], "RETRIEVAL_QUERY"
+    document_vectors = get_policy_embeddings(df)
+
+    question_vector = embed_texts(
+        [question],
+        "RETRIEVAL_QUERY"
     )[0]
 
+    document_norms = np.linalg.norm(
+        document_vectors,
+        axis=1
+    )
+
+    question_norm = np.linalg.norm(
+        question_vector
+    )
+
     denominator = (
-        np.linalg.norm(vectors, axis=1)
-        * np.linalg.norm(query)
+        document_norms * question_norm
     )
 
     similarities = np.divide(
-        vectors @ query,
+        document_vectors @ question_vector,
         denominator,
         out=np.zeros(len(df)),
         where=denominator != 0
     )
 
-    indices = np.argsort(similarities)[::-1][:top_k]
+    top_indices = np.argsort(
+        similarities
+    )[::-1][:top_k]
 
-    return df.iloc[indices]
+    return df.iloc[top_indices].copy()
 
 
+# =========================================================
 # METHOD 2 AND 3: LLM
+# =========================================================
 
 def llm(question, indexed=False):
     df = policies()
 
     if indexed:
-        selected = vector_search(question)
+        selected = vector_search(
+            question,
+            top_k=5
+        )
     else:
         selected = df
 
+    context_parts = []
+
+    for _, row in selected.iterrows():
+
+        context_parts.append(
+            f"POLICY TITLE: {row['title']}\n"
+            f"POLICY TEXT: {row['policy_text']}"
+        )
+
     context = "\n\n".join(
-        f"POLICY TITLE: {r['title']}\n"
-        f"POLICY TEXT: {r['policy_text']}"
-        for _, r in selected.iterrows()
+        context_parts
     )
 
     prompt = f"""
 You are a company policy assistant.
 
-Answer using ONLY the policies provided.
+Answer the employee's question using ONLY the
+company policies provided below.
 
-Rules:
-- Do not invent policies or requirements.
-- Do not use external knowledge.
-- Cite the exact supporting policy title.
-- If the policies do not answer the question,
-  respond exactly:
-  The policy database does not specify.
-- Be concise and clear.
+Requirements:
+1. Do not invent company rules.
+2. Do not use external knowledge.
+3. Identify the exact supporting policy title.
+4. Keep the answer concise and clear.
+5. If the policies do not answer the question,
+   respond exactly:
+   The policy database does not specify.
 
-POLICIES:
+COMPANY POLICIES:
+
 {context}
 
-QUESTION:
+EMPLOYEE QUESTION:
+
 {question}
 """
 
@@ -263,15 +403,19 @@ QUESTION:
 
     usage = response.usage_metadata
 
-    answer = response.text or "No response generated."
-
-    # Indexed policy field contains candidates,
-    # not verified supporting citations.
-    policy = (
-        ", ".join(selected["title"].astype(str))
-        if indexed
-        else "See policy cited in answer"
+    answer = (
+        response.text
+        or "No response generated."
     )
+
+    if indexed:
+        policy = ", ".join(
+            selected["title"]
+            .astype(str)
+            .tolist()
+        )
+    else:
+        policy = "See policy cited in answer"
 
     if answer.strip().lower().startswith(
         "the policy database does not specify"
@@ -282,43 +426,79 @@ QUESTION:
         "answer": answer,
         "policy": policy,
         "tokens": getattr(
-            usage, "total_token_count", None
+            usage,
+            "total_token_count",
+            None
         ),
         "input_tokens": getattr(
-            usage, "prompt_token_count", None
+            usage,
+            "prompt_token_count",
+            None
         ),
         "output_tokens": getattr(
-            usage, "candidates_token_count", None
+            usage,
+            "candidates_token_count",
+            None
         ),
         "status": "Completed"
     }
 
 
-# COMPARISON
+# =========================================================
+# COMPARE ALL THREE APPROACHES
+# =========================================================
 
 def compare(question):
     methods = [
-        ("Rules-based", lambda: rules(question)),
+        (
+            "Rules-based",
+            lambda: rules(question)
+        ),
         (
             "LLM without index",
-            lambda: llm(question, False)
+            lambda: llm(
+                question,
+                indexed=False
+            )
         ),
         (
             "LLM with vector index",
-            lambda: llm(question, True)
+            lambda: llm(
+                question,
+                indexed=True
+            )
         )
     ]
 
-    output = []
+    results = []
 
-    for name, func in methods:
-        start = time.perf_counter()
+    for name, method in methods:
+
+        start_time = time.perf_counter()
 
         try:
-            data = func()
+            data = method()
+
         except Exception as error:
+            message = str(error)
+
+            if (
+                "429" in message
+                and (
+                    "per day" in message.lower()
+                    or "quota" in message.lower()
+                )
+            ):
+                answer = (
+                    "Gemini API daily quota exceeded. "
+                    "Please try again after the quota resets "
+                    "or select a model with available quota."
+                )
+            else:
+                answer = f"Error: {error}"
+
             data = {
-                "answer": f"Error: {error}",
+                "answer": answer,
                 "policy": "—",
                 "tokens": None,
                 "input_tokens": None,
@@ -326,17 +506,20 @@ def compare(question):
                 "status": "Error"
             }
 
-        output.append({
+        elapsed = round(
+            time.perf_counter() - start_time,
+            2
+        )
+
+        results.append({
             "Approach": name,
             "Answer": data["answer"],
             "Relevant policy": data["policy"],
-            "Response time (s)": round(
-                time.perf_counter() - start, 2
-            ),
+            "Response time (s)": elapsed,
             "Total tokens": data.get("tokens"),
             "Input tokens": data.get("input_tokens"),
             "Output tokens": data.get("output_tokens"),
             "Status": data.get("status")
         })
 
-    return output
+    return results
